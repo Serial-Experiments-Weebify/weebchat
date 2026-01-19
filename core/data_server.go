@@ -25,6 +25,7 @@ type DataServer struct {
 	Address   string
 	Control   string
 	SecretKey string
+	NodeID    int64
 
 	// Control plane client
 	controlConn   *grpc.ClientConn
@@ -112,7 +113,6 @@ func (s *DataServer) CreateUser(ctx context.Context, req *chat.CreateUserRequest
 	}
 
 	s.dataLock.Lock()
-	defer s.dataLock.Unlock()
 
 	s.nextUserID++
 	user := &chat.User{
@@ -121,9 +121,19 @@ func (s *DataServer) CreateUser(ctx context.Context, req *chat.CreateUserRequest
 	}
 	s.users[user.Id] = user
 
+	s.dataLock.Unlock()
+
 	log.Printf("CreateUser: %v", user)
 
-	// TODO: propagate
+	ctx = metadata.AppendToOutgoingContext(ctx, SecretKeyHeader, s.SecretKey)
+	_, err := s.backClient.ChainReplicate(ctx, &chat.ChainPayload{
+		Payload: &chat.ChainPayload_User{
+			User: user,
+		},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("Got error: %v", err)
+	}
 
 	return user, nil
 }
@@ -138,7 +148,6 @@ func (s *DataServer) CreateTopic(ctx context.Context, req *chat.CreateTopicReque
 	}
 
 	s.dataLock.Lock()
-	defer s.dataLock.Unlock()
 
 	s.nextTopicID++
 	topic := &chat.Topic{
@@ -148,9 +157,20 @@ func (s *DataServer) CreateTopic(ctx context.Context, req *chat.CreateTopicReque
 	s.topics[topic.Id] = topic
 	s.messages[topic.Id] = make([]*chat.Message, 0)
 
+	s.dataLock.Unlock()
+
 	log.Printf("CreateTopic: %v", topic)
 
-	// TODO: propagate
+	ctx = metadata.AppendToOutgoingContext(ctx, SecretKeyHeader, s.SecretKey)
+	_, err := s.backClient.ChainReplicate(ctx, &chat.ChainPayload{
+		Payload: &chat.ChainPayload_Topic{
+			Topic: topic,
+		},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("Got error: %v", err)
+	}
+
 	return topic, nil
 }
 
@@ -172,17 +192,16 @@ func (s *DataServer) PostMessage(ctx context.Context, req *chat.PostMessageReque
 	}
 
 	s.dataLock.Lock()
-	defer s.dataLock.Unlock()
 
 	topicID := req.GetTopicId()
 	if _, ok := s.topics[topicID]; !ok {
-		log.Printf("PostMessage: topic %d not found", topicID)
-		return nil, nil
+		s.dataLock.Unlock()
+		return nil, fmt.Errorf("topic not found")
 	}
 
 	if _, ok := s.users[req.GetUserId()]; !ok {
-		log.Printf("PostMessage: user %d not found", req.GetUserId())
-		return nil, nil
+		s.dataLock.Unlock()
+		return nil, fmt.Errorf("user not found")
 	}
 
 	s.nextMessageID++
@@ -196,9 +215,19 @@ func (s *DataServer) PostMessage(ctx context.Context, req *chat.PostMessageReque
 	}
 	s.messages[topicID] = append(s.messages[topicID], msg)
 
+	s.dataLock.Unlock()
+
 	log.Printf("PostMessage: %v", msg)
 
-	//TODO: propagate
+	ctx = metadata.AppendToOutgoingContext(ctx, SecretKeyHeader, s.SecretKey)
+	_, err := s.backClient.ChainReplicate(ctx, &chat.ChainPayload{
+		Payload: &chat.ChainPayload_Msg{
+			Msg: msg,
+		},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("Got error: %v", err)
+	}
 
 	return msg, nil
 }
@@ -221,13 +250,12 @@ func (s *DataServer) LikeMessage(ctx context.Context, req *chat.LikeMessageReque
 	}
 
 	s.dataLock.Lock()
-	defer s.dataLock.Unlock()
 
 	topicID := req.GetTopicId()
 	msgs, ok := s.messages[topicID]
 	if !ok {
-		log.Printf("LikeMessage: topic %d not found", topicID)
-		return nil, nil
+		s.dataLock.Unlock()
+		return nil, fmt.Errorf("Topic not found")
 	}
 
 	var msg *chat.Message
@@ -242,10 +270,27 @@ func (s *DataServer) LikeMessage(ctx context.Context, req *chat.LikeMessageReque
 	}
 
 	if msg == nil {
+		s.dataLock.Unlock()
+
 		return nil, fmt.Errorf("message not found")
 	}
 
-	// TODO: propagate
+	s.dataLock.Unlock()
+
+	ctx = metadata.AppendToOutgoingContext(ctx, SecretKeyHeader, s.SecretKey)
+	_, err := s.backClient.ChainReplicate(ctx, &chat.ChainPayload{
+		Payload: &chat.ChainPayload_Like{
+			Like: &chat.Like{
+				MessageId: req.GetMessageId(),
+				TopicId:   topicID,
+				UserId:    req.GetUserId(),
+			},
+		},
+	})
+
+	if err != nil {
+		return nil, fmt.Errorf("Got error: %v", err)
+	}
 
 	return msg, nil
 }
@@ -265,7 +310,7 @@ func (s *DataServer) GetSubscriptionNode(ctx context.Context, req *chat.Subscrip
 }
 
 func (s *DataServer) ListTopics(ctx context.Context, _ *emptypb.Empty) (*chat.ListTopicsResponse, error) {
-	if !s.IsHead() {
+	if !s.IsTail() {
 		return nil, fmt.Errorf("wrong node")
 	}
 
@@ -282,7 +327,7 @@ func (s *DataServer) ListTopics(ctx context.Context, _ *emptypb.Empty) (*chat.Li
 }
 
 func (s *DataServer) GetMessages(ctx context.Context, req *chat.GetMessagesRequest) (*chat.GetMessagesResponse, error) {
-	if !s.IsHead() {
+	if !s.IsTail() {
 		return nil, fmt.Errorf("wrong node")
 	}
 
@@ -314,6 +359,109 @@ func (s *DataServer) GetMessages(ctx context.Context, req *chat.GetMessagesReque
 
 	log.Printf("GetMessages: returning %d messages for topic %d", len(result), topicID)
 	return &chat.GetMessagesResponse{Messages: result}, nil
+}
+
+func (s *DataServer) crUser(u *chat.User) error {
+	s.dataLock.Lock()
+	defer s.dataLock.Unlock()
+
+	if u.Id <= s.nextUserID {
+		return fmt.Errorf("invalid user id")
+	}
+
+	s.nextUserID = u.Id
+	s.users[u.Id] = u
+	return nil
+}
+
+func (s *DataServer) crTopic(t *chat.Topic) error {
+	s.dataLock.Lock()
+	defer s.dataLock.Unlock()
+
+	if t.Id <= s.nextTopicID {
+		return fmt.Errorf("invalid topic id")
+	}
+
+	s.nextTopicID = t.Id
+	s.topics[t.Id] = t
+	s.messages[t.Id] = make([]*chat.Message, 0)
+
+	return nil
+}
+
+func (s *DataServer) crMessage(m *chat.Message) error {
+	s.dataLock.Lock()
+	defer s.dataLock.Unlock()
+
+	if m.Id <= s.nextMessageID {
+		return fmt.Errorf("invalid message id")
+	}
+
+	s.nextMessageID = m.Id
+	s.messages[m.TopicId] = append(s.messages[m.TopicId], m)
+
+	return nil
+}
+
+func (s *DataServer) crLike(l *chat.Like) error {
+	s.dataLock.Lock()
+	defer s.dataLock.Unlock()
+
+	if s.users[l.GetUserId()] == nil {
+		return fmt.Errorf("user not found")
+	}
+
+	msgs, ok := s.messages[l.GetTopicId()]
+
+	if !ok {
+		return fmt.Errorf("topic not found")
+	}
+
+	for _, m := range msgs {
+		if m.Id == l.GetMessageId() {
+			m.Likes += 1
+			return nil
+		}
+	}
+
+	return fmt.Errorf("message not found")
+}
+
+func (s *DataServer) ChainReplicate(ctx context.Context, cp *chat.ChainPayload) (*emptypb.Empty, error) {
+	// check auth
+	if err := s.validateSecretKey(ctx); err != nil {
+		return nil, err
+	}
+
+	err := fmt.Errorf("invalid chain payload")
+
+	if user := cp.GetUser(); user != nil {
+		err = s.crUser(user)
+	} else if topic := cp.GetTopic(); topic != nil {
+		err = s.crTopic(topic)
+	} else if message := cp.GetMsg(); message != nil {
+		err = s.crMessage(message)
+	} else if like := cp.GetLike(); like != nil {
+		err = s.crLike(like)
+	}
+
+	if err != nil {
+		return nil, err
+	}
+
+	if s.IsTail() {
+		log.Printf("Commited %v\n", cp)
+		return &emptypb.Empty{}, nil
+	}
+
+	ctx = metadata.AppendToOutgoingContext(ctx, SecretKeyHeader, s.SecretKey)
+	_, err = s.backClient.ChainReplicate(ctx, cp)
+
+	if err != nil {
+		return nil, fmt.Errorf("Got error: %v", err)
+	}
+
+	return &emptypb.Empty{}, nil
 }
 
 func (s *DataServer) SubscribeTopic(req *chat.SubscribeTopicRequest, stream grpc.ServerStreamingServer[chat.MessageEvent]) error {
@@ -412,6 +560,8 @@ func (s *DataServer) JoinCluster(ctx context.Context) (*chat.JoinClusterResponse
 		return nil, fmt.Errorf("failed to join cluster: %w", err)
 	}
 
+	s.NodeID = resp.GetYou()
+
 	log.Printf("Joined cluster: you=%d, front=%v, back=%v", resp.GetYou(), resp.GetFront(), resp.GetBack())
 	return resp, nil
 }
@@ -430,16 +580,94 @@ func (s *DataServer) GetClusterState(ctx context.Context) (*chat.GetClusterState
 	return resp, nil
 }
 
-func (s *DataServer) syncFromFront() {
+func (s *DataServer) CloneTail(ctx context.Context, req *chat.NodeInfo) (*chat.TailState, error) {
+	// only tail can be cloned
+	if !s.IsTail() {
+		return nil, fmt.Errorf("wrong node")
+	}
+
+	// check auth
+	if err := s.validateSecretKey(ctx); err != nil {
+		return nil, err
+	}
+
+	client, err := s.connectTo(req.GetAddress())
+
+	if err != nil {
+		return nil, err
+	}
+
+	s.nodeMu.Lock()
+	s.back = req
+	s.backClient = client
+	s.nodeMu.Unlock()
+
 	s.dataLock.Lock()
 	defer s.dataLock.Unlock()
 
+	var ts *chat.TailState = &chat.TailState{
+		LastMessageId: s.nextMessageID,
+		LastUserId:    s.nextUserID,
+		LastTopicId:   s.nextTopicID,
+		Users:         make([]*chat.User, 0, len(s.users)),
+		Topics:        make([]*chat.Topic, 0, len(s.topics)),
+		Messages:      make([]*chat.Message, 0, len(s.messages)),
+	}
+
+	for _, u := range s.users {
+		ts.Users = append(ts.Users, u)
+	}
+
+	for _, t := range s.topics {
+		ts.Topics = append(ts.Topics, t)
+	}
+
+	for _, ms := range s.messages {
+		ts.Messages = append(ts.Messages, ms...)
+	}
+
+	return ts, nil
+}
+
+func (s *DataServer) syncFromFront() {
 	if s.frontClient == nil {
 		panic("")
 	}
 
-	// TODO: sync with front node
-	// TODO: notify control/front about this
+	s.dataLock.Lock()
+	defer s.dataLock.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx = metadata.AppendToOutgoingContext(ctx, SecretKeyHeader, s.SecretKey)
+	defer cancel()
+
+	data, err := s.frontClient.CloneTail(ctx, &chat.NodeInfo{
+		NodeId:  s.NodeID,
+		Address: s.Address,
+	})
+
+	if err != nil {
+		panic(err)
+	}
+
+	s.nextMessageID = data.GetLastMessageId()
+	s.nextUserID = data.GetLastUserId()
+	s.nextTopicID = data.GetLastTopicId()
+
+	for _, u := range data.GetUsers() {
+		s.users[u.GetId()] = u
+	}
+
+	for _, t := range data.GetTopics() {
+		s.topics[t.GetId()] = t
+		s.messages[t.GetId()] = make([]*chat.Message, 0)
+	}
+
+	for _, m := range data.GetMessages() {
+		s.messages[m.GetTopicId()] = append(s.messages[m.GetTopicId()], m)
+	}
+
+	log.Printf("syncFromFront: synced %d users, %d topics, %d messages", len(data.GetUsers()), len(data.GetTopics()), len(data.GetMessages()))
 }
 
 func StartDataServer(address, control, secretKey string) (*grpc.Server, error) {

@@ -93,7 +93,7 @@ service MessageBoard {
 
   rpc Ping(google.protobuf.Empty) returns (google.protobuf.Empty);
 
-  rpc CloneTail(google.protobuf.Empty) returns (TailState);
+  rpc CloneTail(NodeInfo) returns (TailState);
 }
 
 message ChainPayload {

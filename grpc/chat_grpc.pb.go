@@ -62,7 +62,7 @@ type MessageBoardClient interface {
 	// Control plane updates
 	UpdateSubscriptions(ctx context.Context, in *NodeCfgSubscriptions, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	Ping(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*emptypb.Empty, error)
-	CloneTail(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*TailState, error)
+	CloneTail(ctx context.Context, in *NodeInfo, opts ...grpc.CallOption) (*TailState, error)
 }
 
 type messageBoardClient struct {
@@ -202,7 +202,7 @@ func (c *messageBoardClient) Ping(ctx context.Context, in *emptypb.Empty, opts .
 	return out, nil
 }
 
-func (c *messageBoardClient) CloneTail(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*TailState, error) {
+func (c *messageBoardClient) CloneTail(ctx context.Context, in *NodeInfo, opts ...grpc.CallOption) (*TailState, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(TailState)
 	err := c.cc.Invoke(ctx, MessageBoard_CloneTail_FullMethodName, in, out, cOpts...)
@@ -239,7 +239,7 @@ type MessageBoardServer interface {
 	// Control plane updates
 	UpdateSubscriptions(context.Context, *NodeCfgSubscriptions) (*emptypb.Empty, error)
 	Ping(context.Context, *emptypb.Empty) (*emptypb.Empty, error)
-	CloneTail(context.Context, *emptypb.Empty) (*TailState, error)
+	CloneTail(context.Context, *NodeInfo) (*TailState, error)
 	mustEmbedUnimplementedMessageBoardServer()
 }
 
@@ -286,7 +286,7 @@ func (UnimplementedMessageBoardServer) UpdateSubscriptions(context.Context, *Nod
 func (UnimplementedMessageBoardServer) Ping(context.Context, *emptypb.Empty) (*emptypb.Empty, error) {
 	return nil, status.Error(codes.Unimplemented, "method Ping not implemented")
 }
-func (UnimplementedMessageBoardServer) CloneTail(context.Context, *emptypb.Empty) (*TailState, error) {
+func (UnimplementedMessageBoardServer) CloneTail(context.Context, *NodeInfo) (*TailState, error) {
 	return nil, status.Error(codes.Unimplemented, "method CloneTail not implemented")
 }
 func (UnimplementedMessageBoardServer) mustEmbedUnimplementedMessageBoardServer() {}
@@ -520,7 +520,7 @@ func _MessageBoard_Ping_Handler(srv interface{}, ctx context.Context, dec func(i
 }
 
 func _MessageBoard_CloneTail_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(emptypb.Empty)
+	in := new(NodeInfo)
 	if err := dec(in); err != nil {
 		return nil, err
 	}
@@ -532,7 +532,7 @@ func _MessageBoard_CloneTail_Handler(srv interface{}, ctx context.Context, dec f
 		FullMethod: MessageBoard_CloneTail_FullMethodName,
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(MessageBoardServer).CloneTail(ctx, req.(*emptypb.Empty))
+		return srv.(MessageBoardServer).CloneTail(ctx, req.(*NodeInfo))
 	}
 	return interceptor(ctx, in, info, handler)
 }

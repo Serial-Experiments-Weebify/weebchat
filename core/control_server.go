@@ -68,24 +68,21 @@ func (s *ControlServer) GetClusterState(ctx context.Context, _ *emptypb.Empty) (
 const SecretKeyHeader = "x-secret-key"
 
 func createNode(info *chat.NodeInfo) (*DataNode, error) {
-	log.Printf("NewClient %s\n", info.Address)
 	conn, err := grpc.NewClient(info.Address, grpc.WithTransportCredentials(insecure.NewCredentials()))
 
 	if err != nil {
-		log.Printf("Failed... %v\n", err)
+		log.Printf("Client failed... %v\n", err)
 		return nil, err
 	}
 
-	log.Printf("MessageBoardClient %s\n", info.Address)
 	client := chat.NewMessageBoardClient(conn)
 
-	log.Printf("Pinging... %s\n", info.Address)
 	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 	defer cancel()
 	_, err = client.Ping(ctx, &emptypb.Empty{})
 
 	if err != nil {
-		log.Printf("Failed... %v\n", err)
+		log.Printf("Ping failed... %v\n", err)
 		return nil, err
 	}
 
@@ -109,7 +106,7 @@ func (s *ControlServer) JoinCluster(ctx context.Context, req *chat.JoinClusterRe
 	s.nodeMu.Lock()
 	defer s.nodeMu.Unlock()
 
-	log.Printf("JoinCluster called - self: %s", req.GetSelf())
+	log.Printf("JoinCluster: %s", req.GetSelf())
 
 	s.nextNodeIdx++
 	node, err := createNode(&chat.NodeInfo{
@@ -134,29 +131,30 @@ func (s *ControlServer) JoinCluster(ctx context.Context, req *chat.JoinClusterRe
 		log.Printf("Node joined - setting as new tail")
 	}
 
-	if cTail != nil {
-		tPredIdx := len(s.nodes) - 2
-		var tPred *DataNode
+	// Skip reconfiguring node, it will be done by the new node itself
+	// if cTail != nil {
+	// tPredIdx := len(s.nodes) - 2
+	// var tPred *DataNode
 
-		if tPredIdx >= 0 {
-			tPred = s.nodes[tPredIdx]
-		}
+	// if tPredIdx >= 0 {
+	// tPred = s.nodes[tPredIdx]
+	// }
 
-		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
-		ctx = metadata.AppendToOutgoingContext(ctx, SecretKeyHeader, s.SecretKey)
-		defer cancel()
-		_, err := (*cTail.Client).ReconfigureNode(ctx, &chat.NodeConfiguration{
-			Predecessor: tPred.Info,
-			Successor:   s.tail.Info,
-		})
+	// ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	// ctx = metadata.AppendToOutgoingContext(ctx, SecretKeyHeader, s.SecretKey)
+	// defer cancel()
+	// _, err := (*cTail.Client).ReconfigureNode(ctx, &chat.NodeConfiguration{
+	// 	Predecessor: tPred.Info,
+	// 	Successor:   s.tail.Info,
+	// })
 
-		if err != nil {
-			// remove the node we just added
-			s.nodes = s.nodes[:len(s.nodes)-1]
-			s.tail = cTail
-			return nil, status.Errorf(codes.Internal, "failed to reconfigure old tail: %v", err)
-		}
-	}
+	// if err != nil {
+	// 	// remove the node we just added
+	// 	s.nodes = s.nodes[:len(s.nodes)-1]
+	// 	s.tail = cTail
+	// 	return nil, status.Errorf(codes.Internal, "failed to reconfigure old tail: %v", err)
+	// }
+	// }
 
 	return &chat.JoinClusterResponse{
 		You:   node.Info.NodeId,
