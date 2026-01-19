@@ -30,7 +30,6 @@ const (
 	MessageBoard_SubscribeTopic_FullMethodName      = "/chat.MessageBoard/SubscribeTopic"
 	MessageBoard_ChainReplicate_FullMethodName      = "/chat.MessageBoard/ChainReplicate"
 	MessageBoard_ReconfigureNode_FullMethodName     = "/chat.MessageBoard/ReconfigureNode"
-	MessageBoard_UpdateSubscriptions_FullMethodName = "/chat.MessageBoard/UpdateSubscriptions"
 	MessageBoard_Ping_FullMethodName                = "/chat.MessageBoard/Ping"
 	MessageBoard_CloneTail_FullMethodName           = "/chat.MessageBoard/CloneTail"
 )
@@ -59,8 +58,6 @@ type MessageBoardClient interface {
 	ChainReplicate(ctx context.Context, in *ChainPayload, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	// Control plane notifications
 	ReconfigureNode(ctx context.Context, in *NodeConfiguration, opts ...grpc.CallOption) (*emptypb.Empty, error)
-	// Control plane updates
-	UpdateSubscriptions(ctx context.Context, in *NodeCfgSubscriptions, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	Ping(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	CloneTail(ctx context.Context, in *NodeInfo, opts ...grpc.CallOption) (*TailState, error)
 }
@@ -182,16 +179,6 @@ func (c *messageBoardClient) ReconfigureNode(ctx context.Context, in *NodeConfig
 	return out, nil
 }
 
-func (c *messageBoardClient) UpdateSubscriptions(ctx context.Context, in *NodeCfgSubscriptions, opts ...grpc.CallOption) (*emptypb.Empty, error) {
-	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(emptypb.Empty)
-	err := c.cc.Invoke(ctx, MessageBoard_UpdateSubscriptions_FullMethodName, in, out, cOpts...)
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
 func (c *messageBoardClient) Ping(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*emptypb.Empty, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(emptypb.Empty)
@@ -236,8 +223,6 @@ type MessageBoardServer interface {
 	ChainReplicate(context.Context, *ChainPayload) (*emptypb.Empty, error)
 	// Control plane notifications
 	ReconfigureNode(context.Context, *NodeConfiguration) (*emptypb.Empty, error)
-	// Control plane updates
-	UpdateSubscriptions(context.Context, *NodeCfgSubscriptions) (*emptypb.Empty, error)
 	Ping(context.Context, *emptypb.Empty) (*emptypb.Empty, error)
 	CloneTail(context.Context, *NodeInfo) (*TailState, error)
 	mustEmbedUnimplementedMessageBoardServer()
@@ -279,9 +264,6 @@ func (UnimplementedMessageBoardServer) ChainReplicate(context.Context, *ChainPay
 }
 func (UnimplementedMessageBoardServer) ReconfigureNode(context.Context, *NodeConfiguration) (*emptypb.Empty, error) {
 	return nil, status.Error(codes.Unimplemented, "method ReconfigureNode not implemented")
-}
-func (UnimplementedMessageBoardServer) UpdateSubscriptions(context.Context, *NodeCfgSubscriptions) (*emptypb.Empty, error) {
-	return nil, status.Error(codes.Unimplemented, "method UpdateSubscriptions not implemented")
 }
 func (UnimplementedMessageBoardServer) Ping(context.Context, *emptypb.Empty) (*emptypb.Empty, error) {
 	return nil, status.Error(codes.Unimplemented, "method Ping not implemented")
@@ -483,24 +465,6 @@ func _MessageBoard_ReconfigureNode_Handler(srv interface{}, ctx context.Context,
 	return interceptor(ctx, in, info, handler)
 }
 
-func _MessageBoard_UpdateSubscriptions_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(NodeCfgSubscriptions)
-	if err := dec(in); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return srv.(MessageBoardServer).UpdateSubscriptions(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: MessageBoard_UpdateSubscriptions_FullMethodName,
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(MessageBoardServer).UpdateSubscriptions(ctx, req.(*NodeCfgSubscriptions))
-	}
-	return interceptor(ctx, in, info, handler)
-}
-
 func _MessageBoard_Ping_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(emptypb.Empty)
 	if err := dec(in); err != nil {
@@ -581,10 +545,6 @@ var MessageBoard_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _MessageBoard_ReconfigureNode_Handler,
 		},
 		{
-			MethodName: "UpdateSubscriptions",
-			Handler:    _MessageBoard_UpdateSubscriptions_Handler,
-		},
-		{
 			MethodName: "Ping",
 			Handler:    _MessageBoard_Ping_Handler,
 		},
@@ -604,8 +564,9 @@ var MessageBoard_ServiceDesc = grpc.ServiceDesc{
 }
 
 const (
-	ControlPlane_GetClusterState_FullMethodName = "/chat.ControlPlane/GetClusterState"
-	ControlPlane_JoinCluster_FullMethodName     = "/chat.ControlPlane/JoinCluster"
+	ControlPlane_GetClusterState_FullMethodName         = "/chat.ControlPlane/GetClusterState"
+	ControlPlane_JoinCluster_FullMethodName             = "/chat.ControlPlane/JoinCluster"
+	ControlPlane_RequestSubscriptionNode_FullMethodName = "/chat.ControlPlane/RequestSubscriptionNode"
 )
 
 // ControlPlaneClient is the client API for ControlPlane service.
@@ -616,6 +577,7 @@ const (
 type ControlPlaneClient interface {
 	GetClusterState(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*GetClusterStateResponse, error)
 	JoinCluster(ctx context.Context, in *JoinClusterRequest, opts ...grpc.CallOption) (*JoinClusterResponse, error)
+	RequestSubscriptionNode(ctx context.Context, in *SubRequest, opts ...grpc.CallOption) (*SubscriptionNodeResponse, error)
 }
 
 type controlPlaneClient struct {
@@ -646,6 +608,16 @@ func (c *controlPlaneClient) JoinCluster(ctx context.Context, in *JoinClusterReq
 	return out, nil
 }
 
+func (c *controlPlaneClient) RequestSubscriptionNode(ctx context.Context, in *SubRequest, opts ...grpc.CallOption) (*SubscriptionNodeResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(SubscriptionNodeResponse)
+	err := c.cc.Invoke(ctx, ControlPlane_RequestSubscriptionNode_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // ControlPlaneServer is the server API for ControlPlane service.
 // All implementations must embed UnimplementedControlPlaneServer
 // for forward compatibility.
@@ -654,6 +626,7 @@ func (c *controlPlaneClient) JoinCluster(ctx context.Context, in *JoinClusterReq
 type ControlPlaneServer interface {
 	GetClusterState(context.Context, *emptypb.Empty) (*GetClusterStateResponse, error)
 	JoinCluster(context.Context, *JoinClusterRequest) (*JoinClusterResponse, error)
+	RequestSubscriptionNode(context.Context, *SubRequest) (*SubscriptionNodeResponse, error)
 	mustEmbedUnimplementedControlPlaneServer()
 }
 
@@ -669,6 +642,9 @@ func (UnimplementedControlPlaneServer) GetClusterState(context.Context, *emptypb
 }
 func (UnimplementedControlPlaneServer) JoinCluster(context.Context, *JoinClusterRequest) (*JoinClusterResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method JoinCluster not implemented")
+}
+func (UnimplementedControlPlaneServer) RequestSubscriptionNode(context.Context, *SubRequest) (*SubscriptionNodeResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method RequestSubscriptionNode not implemented")
 }
 func (UnimplementedControlPlaneServer) mustEmbedUnimplementedControlPlaneServer() {}
 func (UnimplementedControlPlaneServer) testEmbeddedByValue()                      {}
@@ -727,6 +703,24 @@ func _ControlPlane_JoinCluster_Handler(srv interface{}, ctx context.Context, dec
 	return interceptor(ctx, in, info, handler)
 }
 
+func _ControlPlane_RequestSubscriptionNode_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SubRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ControlPlaneServer).RequestSubscriptionNode(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ControlPlane_RequestSubscriptionNode_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ControlPlaneServer).RequestSubscriptionNode(ctx, req.(*SubRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // ControlPlane_ServiceDesc is the grpc.ServiceDesc for ControlPlane service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -741,6 +735,10 @@ var ControlPlane_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "JoinCluster",
 			Handler:    _ControlPlane_JoinCluster_Handler,
+		},
+		{
+			MethodName: "RequestSubscriptionNode",
+			Handler:    _ControlPlane_RequestSubscriptionNode_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

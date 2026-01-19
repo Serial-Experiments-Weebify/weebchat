@@ -3,6 +3,7 @@ package core
 import (
 	"context"
 	"log"
+	"slices"
 	"sync"
 	"time"
 
@@ -27,12 +28,14 @@ type ControlServer struct {
 	head        *DataNode
 	tail        *DataNode
 	nodes       []*DataNode
+	topics      []int64
 }
 
 type DataNode struct {
 	Info   *chat.NodeInfo
 	Conn   *grpc.ClientConn
 	Client *chat.MessageBoardClient
+	Topics []int64
 }
 
 func NewControlServer(
@@ -93,6 +96,123 @@ func createNode(info *chat.NodeInfo) (*DataNode, error) {
 	}, nil
 }
 
+func spreadTopics(topics *[]int64, nodes *[]*DataNode) {
+	for node := range *nodes {
+		(*nodes)[node].Topics = make([]int64, 0)
+	}
+
+	if len(*nodes) < 3 {
+		return
+	}
+
+	nSubNodes := len(*nodes) - 2
+
+	for i, topic := range *topics {
+		targetNode := (i % nSubNodes) + 1
+		(*nodes)[targetNode].Topics = append((*nodes)[targetNode].Topics, topic)
+	}
+}
+func (s *ControlServer) nodeDead(node *DataNode) {
+	s.nodeMu.Lock()
+	defer s.nodeMu.Unlock()
+	s.nodeDeadNOLOCK(node)
+}
+
+func (s *ControlServer) nodeDeadNOLOCK(node *DataNode) {
+badnode:
+	for {
+		log.Printf("Node dead: %v", node.Info)
+
+		var idx int = -1
+
+		for i, n := range s.nodes {
+			if n.Info.NodeId == node.Info.NodeId {
+				idx = i
+				break
+			}
+		}
+
+		if idx == -1 {
+			log.Print("Node not found in list!")
+			return
+		}
+
+		if len(s.nodes) == 0 {
+			log.Print("No nodes left in cluster!")
+		}
+
+		if idx == 0 {
+			s.nodes = s.nodes[1:]
+		} else if idx == len(s.nodes)-1 {
+			s.nodes = s.nodes[:len(s.nodes)-1]
+		} else {
+			s.nodes = append(s.nodes[:idx], s.nodes[idx+1:]...)
+		}
+
+		if len(s.nodes) == 0 {
+			s.head = nil
+			s.tail = nil
+		} else {
+			s.head = s.nodes[0]
+			s.tail = s.nodes[len(s.nodes)-1]
+		}
+
+		// reconfigure all nodes
+		spreadTopics(&s.topics, &s.nodes)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+		ctx = metadata.AppendToOutgoingContext(ctx, SecretKeyHeader, s.SecretKey)
+		defer cancel()
+
+		for i, n := range s.nodes {
+			var pred *DataNode = nil
+			var succ *DataNode = nil
+
+			if i > 0 {
+				pred = s.nodes[i-1]
+			}
+
+			if i < len(s.nodes)-1 {
+				succ = s.nodes[i+1]
+			}
+
+			_, err := (*n.Client).ReconfigureNode(ctx, &chat.NodeConfiguration{
+				Predecessor: nodeInfo(pred),
+				Successor:   nodeInfo(succ),
+				TopicIds:    n.Topics,
+			})
+
+			if err != nil {
+				node = n
+				continue badnode
+			}
+		}
+
+		// all ok
+		break
+	}
+}
+
+func (s *ControlServer) pingRoutine(node *DataNode) {
+	log.Printf("Watching health of %v", node.Info)
+
+	for {
+		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+		ctx = metadata.AppendToOutgoingContext(ctx, SecretKeyHeader, s.SecretKey)
+		_, err := (*node.Client).Ping(ctx, &emptypb.Empty{})
+
+		if err != nil {
+			log.Printf("Node ping %v: Error: %v", node.Info, err)
+			s.nodeDead(node)
+			cancel()
+			return
+		}
+		cancel()
+
+		time.Sleep(5 * time.Second)
+	}
+}
+
 func (s *ControlServer) JoinCluster(ctx context.Context, req *chat.JoinClusterRequest) (*chat.JoinClusterResponse, error) {
 	// Validate secret key from metadata
 	if err := s.validateSecretKey(ctx); err != nil {
@@ -131,36 +251,91 @@ func (s *ControlServer) JoinCluster(ctx context.Context, req *chat.JoinClusterRe
 		log.Printf("Node joined - setting as new tail")
 	}
 
-	// Skip reconfiguring node, it will be done by the new node itself
-	// if cTail != nil {
-	// tPredIdx := len(s.nodes) - 2
-	// var tPred *DataNode
-
-	// if tPredIdx >= 0 {
-	// tPred = s.nodes[tPredIdx]
-	// }
-
-	// ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
-	// ctx = metadata.AppendToOutgoingContext(ctx, SecretKeyHeader, s.SecretKey)
-	// defer cancel()
-	// _, err := (*cTail.Client).ReconfigureNode(ctx, &chat.NodeConfiguration{
-	// 	Predecessor: tPred.Info,
-	// 	Successor:   s.tail.Info,
-	// })
-
-	// if err != nil {
-	// 	// remove the node we just added
-	// 	s.nodes = s.nodes[:len(s.nodes)-1]
-	// 	s.tail = cTail
-	// 	return nil, status.Errorf(codes.Internal, "failed to reconfigure old tail: %v", err)
-	// }
-	// }
+	go s.pingRoutine(node)
 
 	return &chat.JoinClusterResponse{
 		You:   node.Info.NodeId,
 		Front: nodeInfo(cTail),
 		Back:  nil,
 	}, nil
+}
+
+func nodeWithLeastTopics(arr *[]*DataNode) *DataNode {
+	if len(*arr) == 0 {
+		return nil
+	}
+
+	minNode := (*arr)[1]
+	minTopics := len(minNode.Topics)
+
+	for i := range len(*arr) - 2 {
+		node := (*arr)[i+1]
+		if len(node.Topics) < minTopics {
+			minNode = node
+			minTopics = len(node.Topics)
+		}
+	}
+
+	return minNode
+}
+
+func (s *ControlServer) RequestSubscriptionNode(ctx context.Context, req *chat.SubRequest) (*chat.SubscriptionNodeResponse, error) {
+	if err := s.validateSecretKey(ctx); err != nil {
+		return nil, err
+	}
+
+	s.nodeMu.Lock()
+	defer s.nodeMu.Unlock()
+
+	aware := slices.Contains(s.topics, req.GetTopicId())
+
+	if !aware {
+		s.topics = append(s.topics, req.GetTopicId())
+		// new topic, find a node to serve it
+
+		if len(s.nodes) < 3 {
+			return nil, status.Error(codes.NotFound, "subscriptions not available")
+		}
+
+		targetNode := nodeWithLeastTopics(&s.nodes)
+
+		targetNode.Topics = append(targetNode.Topics, req.GetTopicId())
+
+		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+		ctx = metadata.AppendToOutgoingContext(ctx, SecretKeyHeader, s.SecretKey)
+		defer cancel()
+
+		before := s.nodes[len(targetNode.Topics)-1]
+		after := s.nodes[len(targetNode.Topics)+1]
+
+		_, err := (*targetNode.Client).ReconfigureNode(ctx, &chat.NodeConfiguration{
+			Predecessor: nodeInfo(before),
+			Successor:   nodeInfo(after),
+			TopicIds:    targetNode.Topics,
+		})
+
+		if err == nil {
+			return &chat.SubscriptionNodeResponse{
+				Node:           targetNode.Info,
+				SubscribeToken: "<3",
+			}, nil
+		}
+
+		s.nodeDeadNOLOCK(targetNode)
+	}
+
+	// we are now aware of the topic, find a node that serves it
+
+	for _, node := range s.nodes {
+		if slices.Contains(node.Topics, req.GetTopicId()) {
+			return &chat.SubscriptionNodeResponse{
+				Node:           node.Info,
+				SubscribeToken: "<3",
+			}, nil
+		}
+	}
+
+	return nil, status.Error(codes.NotFound, "subscriptions not available")
 }
 
 // validateSecretKey checks if the request contains a valid secret key in metadata

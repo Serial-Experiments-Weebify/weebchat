@@ -19,6 +19,12 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
+// subscriber represents an active subscription to a topic
+type subscriber struct {
+	ch     chan *chat.MessageEvent
+	userID int64
+}
+
 type DataServer struct {
 	chat.UnimplementedMessageBoardServer
 
@@ -48,18 +54,24 @@ type DataServer struct {
 	topics        map[int64]*chat.Topic
 	messages      map[int64][]*chat.Message // topic_id -> messages
 
+	// Subscriptions: topic_id -> list of subscribers
+	subMu         sync.RWMutex
+	subscriptions map[int64]map[*subscriber]struct{}
+	nextSeqNum    int64
+
 	// Node configuration
 	config *chat.NodeConfiguration
 }
 
 func NewDataServer(address, control, secretKey string) *DataServer {
 	return &DataServer{
-		Address:   address,
-		Control:   control,
-		SecretKey: secretKey,
-		users:     make(map[int64]*chat.User),
-		topics:    make(map[int64]*chat.Topic),
-		messages:  make(map[int64][]*chat.Message),
+		Address:       address,
+		Control:       control,
+		SecretKey:     secretKey,
+		users:         make(map[int64]*chat.User),
+		topics:        make(map[int64]*chat.Topic),
+		messages:      make(map[int64][]*chat.Message),
+		subscriptions: make(map[int64]map[*subscriber]struct{}),
 	}
 }
 
@@ -296,17 +308,40 @@ func (s *DataServer) LikeMessage(ctx context.Context, req *chat.LikeMessageReque
 }
 
 func (s *DataServer) GetSubscriptionNode(ctx context.Context, req *chat.SubscriptionNodeRequest) (*chat.SubscriptionNodeResponse, error) {
-	s.dataLock.RLock()
-	defer s.dataLock.RUnlock()
+	if !s.IsHead() {
+		return nil, fmt.Errorf("wrong node")
+	}
 
-	// Dummy: return self as subscription node
-	return &chat.SubscriptionNodeResponse{
-		SubscribeToken: "dummy-token",
-		Node: &chat.NodeInfo{
-			NodeId:  1,
-			Address: s.Address,
-		},
-	}, nil
+	if req.GetTopicId() <= 0 {
+		return nil, fmt.Errorf("missing topic id")
+	}
+
+	if req.GetUserId() <= 0 {
+		return nil, fmt.Errorf("missing user id")
+
+	}
+
+	s.dataLock.RLock()
+
+	if _, ok := s.users[req.GetUserId()]; !ok {
+		s.dataLock.RUnlock()
+		return nil, fmt.Errorf("user not found")
+	}
+	s.dataLock.RUnlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	ctx = metadata.AppendToOutgoingContext(ctx, SecretKeyHeader, s.SecretKey)
+	defer cancel()
+
+	r, err := s.controlClient.RequestSubscriptionNode(ctx, &chat.SubRequest{
+		TopicId: req.GetTopicId(),
+	})
+
+	if err != nil {
+		return nil, fmt.Errorf("remote: %v", err)
+	}
+
+	return r, nil
 }
 
 func (s *DataServer) ListTopics(ctx context.Context, _ *emptypb.Empty) (*chat.ListTopicsResponse, error) {
@@ -427,6 +462,106 @@ func (s *DataServer) crLike(l *chat.Like) error {
 	return fmt.Errorf("message not found")
 }
 
+// broadcastEvent sends an event to all subscribers of the relevant topic
+func (s *DataServer) broadcastEvent(cp *chat.ChainPayload) {
+	var topicID int64
+	var event *chat.MessageEvent
+
+	s.subMu.Lock()
+	s.nextSeqNum++
+	seqNum := s.nextSeqNum
+	s.subMu.Unlock()
+
+	if msg := cp.GetMsg(); msg != nil {
+		topicID = msg.GetTopicId()
+		event = &chat.MessageEvent{
+			SequenceNumber: seqNum,
+			Op:             chat.OpType_OP_POST,
+			Message:        msg,
+			EventAt:        timestamppb.Now(),
+		}
+	} else if like := cp.GetLike(); like != nil {
+		topicID = like.GetTopicId()
+		// Get the updated message for the like event
+		s.dataLock.RLock()
+		msgs := s.messages[topicID]
+		var likedMsg *chat.Message
+		for _, m := range msgs {
+			if m.Id == like.GetMessageId() {
+				likedMsg = m
+				break
+			}
+		}
+		s.dataLock.RUnlock()
+
+		if likedMsg == nil {
+			log.Printf("broadcastEvent: message %d not found for like", like.GetMessageId())
+			return
+		}
+
+		event = &chat.MessageEvent{
+			SequenceNumber: seqNum,
+			Op:             chat.OpType_OP_LIKE,
+			Message:        likedMsg,
+			EventAt:        timestamppb.Now(),
+		}
+	} else {
+		// User or Topic creation - no subscription broadcast needed
+		return
+	}
+
+	s.subMu.RLock()
+	subs := s.subscriptions[topicID]
+	s.subMu.RUnlock()
+
+	if subs == nil {
+		return
+	}
+
+	// Send to all subscribers (non-blocking to avoid slow subscribers blocking others)
+	s.subMu.RLock()
+	for sub := range subs {
+		select {
+		case sub.ch <- event:
+			// Sent successfully
+		default:
+			// Channel full, skip this subscriber (they might be slow)
+			log.Printf("broadcastEvent: dropping event for slow subscriber (user %d)", sub.userID)
+		}
+	}
+	s.subMu.RUnlock()
+}
+
+// handleTopicLoss closes subscriptions for topics that are no longer handled by this node
+func (s *DataServer) handleTopicLoss(oldConfig, newConfig *chat.NodeConfiguration) {
+	if oldConfig == nil {
+		return
+	}
+
+	// Build set of new topic IDs
+	newTopics := make(map[int64]struct{})
+	for _, tid := range newConfig.GetTopicIds() {
+		newTopics[tid] = struct{}{}
+	}
+
+	// Find topics that were in old config but not in new
+	s.subMu.Lock()
+	defer s.subMu.Unlock()
+
+	for _, tid := range oldConfig.GetTopicIds() {
+		if _, exists := newTopics[tid]; !exists {
+			// Topic lost - close all subscriptions for this topic
+			if subs := s.subscriptions[tid]; subs != nil {
+				log.Printf("handleTopicLoss: closing %d subscriptions for topic %d", len(subs), tid)
+				for sub := range subs {
+					close(sub.ch)
+				}
+				delete(s.subscriptions, tid)
+			}
+		}
+	}
+}
+
 func (s *DataServer) ChainReplicate(ctx context.Context, cp *chat.ChainPayload) (*emptypb.Empty, error) {
 	// check auth
 	if err := s.validateSecretKey(ctx); err != nil {
@@ -449,13 +584,24 @@ func (s *DataServer) ChainReplicate(ctx context.Context, cp *chat.ChainPayload) 
 		return nil, err
 	}
 
-	if s.IsTail() {
+	s.nodeMu.RLock()
+	isTail := s.back == nil
+	s.nodeMu.RUnlock()
+
+	if isTail {
 		log.Printf("Commited %v\n", cp)
 		return &emptypb.Empty{}, nil
 	}
 
+	// Broadcast to any subscribers on this node (subscriptions go to middle nodes only)
+	s.broadcastEvent(cp)
+
 	ctx = metadata.AppendToOutgoingContext(ctx, SecretKeyHeader, s.SecretKey)
-	_, err = s.backClient.ChainReplicate(ctx, cp)
+	s.nodeMu.RLock()
+	backClient := s.backClient
+	s.nodeMu.RUnlock()
+
+	_, err = backClient.ChainReplicate(ctx, cp)
 
 	if err != nil {
 		return nil, fmt.Errorf("Got error: %v", err)
@@ -465,11 +611,85 @@ func (s *DataServer) ChainReplicate(ctx context.Context, cp *chat.ChainPayload) 
 }
 
 func (s *DataServer) SubscribeTopic(req *chat.SubscribeTopicRequest, stream grpc.ServerStreamingServer[chat.MessageEvent]) error {
+	topicID := req.GetTopicId()
+	userID := req.GetUserId()
+	fromMsgID := req.GetFromMessageId()
 
-	log.Printf("SubscribeTopic: user %d subscribing to topics %v", req.GetUserId(), req.GetTopicId())
-	// Dummy: keep stream open but don't send anything
-	<-stream.Context().Done()
-	return nil
+	log.Printf("SubscribeTopic: user %d subscribing to topic %d from message %d", userID, topicID, fromMsgID)
+
+	// Check if topic exists
+	s.dataLock.RLock()
+	if _, ok := s.topics[topicID]; !ok {
+		s.dataLock.RUnlock()
+		return status.Errorf(codes.NotFound, "topic %d not found", topicID)
+	}
+	s.dataLock.RUnlock()
+
+	// Create subscriber
+	sub := &subscriber{
+		ch:     make(chan *chat.MessageEvent, 100), // buffered channel
+		userID: userID,
+	}
+
+	// Register subscriber
+	s.subMu.Lock()
+	if s.subscriptions[topicID] == nil {
+		s.subscriptions[topicID] = make(map[*subscriber]struct{})
+	}
+	s.subscriptions[topicID][sub] = struct{}{}
+	s.subMu.Unlock()
+
+	// Cleanup on exit
+	defer func() {
+		s.subMu.Lock()
+		delete(s.subscriptions[topicID], sub)
+		if len(s.subscriptions[topicID]) == 0 {
+			delete(s.subscriptions, topicID)
+		}
+		s.subMu.Unlock()
+		close(sub.ch)
+		log.Printf("SubscribeTopic: user %d unsubscribed from topic %d", userID, topicID)
+	}()
+
+	// Send historical messages first
+	s.dataLock.RLock()
+	msgs := s.messages[topicID]
+	for _, msg := range msgs {
+		if msg.Id > fromMsgID {
+			event := &chat.MessageEvent{
+				SequenceNumber: msg.Id,
+				Op:             chat.OpType_OP_POST,
+				Message:        msg,
+				EventAt:        msg.CreatedAt,
+			}
+			if err := stream.Send(event); err != nil {
+				s.dataLock.RUnlock()
+				return err
+			}
+		}
+	}
+	s.dataLock.RUnlock()
+
+	// Stream new events
+	ctx := stream.Context()
+	for {
+		select {
+		case <-ctx.Done():
+			// Client disconnected
+			log.Printf("SubscribeTopic: client context done for user %d on topic %d", userID, topicID)
+			return ctx.Err()
+		case event, ok := <-sub.ch:
+			if !ok {
+				// Channel closed (topic removed or server reconfigured)
+				log.Printf("SubscribeTopic: channel closed for user %d on topic %d", userID, topicID)
+				return status.Error(codes.Unavailable, "subscription terminated: topic no longer available on this node")
+			}
+			if err := stream.Send(event); err != nil {
+				log.Printf("SubscribeTopic: failed to send event to user %d: %v", userID, err)
+				return err
+			}
+		}
+	}
 }
 
 func (s *DataServer) ReconfigureNode(ctx context.Context, cfg *chat.NodeConfiguration) (*emptypb.Empty, error) {
@@ -482,21 +702,41 @@ func (s *DataServer) ReconfigureNode(ctx context.Context, cfg *chat.NodeConfigur
 
 	s.dataLock.Lock()
 	defer s.dataLock.Unlock()
+	s.nodeMu.Lock()
+	defer s.nodeMu.Unlock()
 
-	// TODO: impl
-
+	oldConfig := s.config
 	s.config = cfg
 	log.Printf("ReconfigureNode: predecessor=%v, successor=%v, topics=%v",
 		cfg.GetPredecessor(), cfg.GetSuccessor(), cfg.GetTopicIds())
 
-	return &emptypb.Empty{}, nil
-}
+	if cfg.GetPredecessor() == nil {
+		s.front = nil
+		s.frontClient = nil
+	} else {
+		s.front = cfg.GetPredecessor()
+		client, err := s.connectTo(s.front.Address)
+		if err != nil {
+			log.Panicf("failed to connect to front node: %v", err)
+		}
+		s.frontClient = client
+	}
 
-func (s *DataServer) UpdateSubscriptions(ctx context.Context, cfg *chat.NodeCfgSubscriptions) (*emptypb.Empty, error) {
-	s.dataLock.Lock()
-	defer s.dataLock.Unlock()
+	if cfg.GetSuccessor() == nil {
+		s.back = nil
+		s.backClient = nil
+	} else {
+		s.back = cfg.GetSuccessor()
+		client, err := s.connectTo(s.back.Address)
+		if err != nil {
+			log.Panicf("failed to connect to back node: %v", err)
+		}
+		s.backClient = client
+	}
 
-	log.Printf("UpdateSubscriptions: topics=%v", cfg.GetTopicIds())
+	// Handle topic loss: close subscriptions for topics this node no longer handles
+	s.handleTopicLoss(oldConfig, cfg)
+
 	return &emptypb.Empty{}, nil
 }
 
@@ -525,12 +765,6 @@ func (s *DataServer) connectTo(address string) (chat.MessageBoardClient, error) 
 	}
 	client := chat.NewMessageBoardClient(conn)
 	return client, nil
-}
-
-func (s *DataServer) closeConnection(c *grpc.ClientConn) {
-	if c != nil {
-		_ = c.Close()
-	}
 }
 
 // CloseControlConnection closes the control plane connection
@@ -636,6 +870,8 @@ func (s *DataServer) syncFromFront() {
 
 	s.dataLock.Lock()
 	defer s.dataLock.Unlock()
+	s.nodeMu.Lock()
+	defer s.nodeMu.Unlock()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	ctx = metadata.AppendToOutgoingContext(ctx, SecretKeyHeader, s.SecretKey)
