@@ -260,23 +260,25 @@ func (s *ControlServer) JoinCluster(ctx context.Context, req *chat.JoinClusterRe
 	}, nil
 }
 
-func nodeWithLeastTopics(arr *[]*DataNode) *DataNode {
+func nodeWithLeastTopics(arr *[]*DataNode) (*DataNode, int64) {
 	if len(*arr) == 0 {
-		return nil
+		return nil, -1
 	}
 
 	minNode := (*arr)[1]
 	minTopics := len(minNode.Topics)
+	idx := int64(1)
 
 	for i := range len(*arr) - 2 {
 		node := (*arr)[i+1]
 		if len(node.Topics) < minTopics {
 			minNode = node
 			minTopics = len(node.Topics)
+			idx = int64(i + 1)
 		}
 	}
 
-	return minNode
+	return minNode, int64(idx)
 }
 
 func (s *ControlServer) RequestSubscriptionNode(ctx context.Context, req *chat.SubRequest) (*chat.SubscriptionNodeResponse, error) {
@@ -297,7 +299,7 @@ func (s *ControlServer) RequestSubscriptionNode(ctx context.Context, req *chat.S
 			return nil, status.Error(codes.NotFound, "subscriptions not available")
 		}
 
-		targetNode := nodeWithLeastTopics(&s.nodes)
+		targetNode, idx := nodeWithLeastTopics(&s.nodes)
 
 		targetNode.Topics = append(targetNode.Topics, req.GetTopicId())
 
@@ -305,8 +307,8 @@ func (s *ControlServer) RequestSubscriptionNode(ctx context.Context, req *chat.S
 		ctx = metadata.AppendToOutgoingContext(ctx, SecretKeyHeader, s.SecretKey)
 		defer cancel()
 
-		before := s.nodes[len(targetNode.Topics)-1]
-		after := s.nodes[len(targetNode.Topics)+1]
+		before := s.nodes[idx-1]
+		after := s.nodes[idx+1]
 
 		_, err := (*targetNode.Client).ReconfigureNode(ctx, &chat.NodeConfiguration{
 			Predecessor: nodeInfo(before),
