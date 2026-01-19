@@ -94,7 +94,7 @@ onMounted(() => {
     <div id="content">
       <div class="messages">
         <div v-for="msg in messages" :key="msg.id" class="message">
-          <span class="username">{{ msg.id }}:</span>
+          <span class="username">User#{{ msg.user_id ?? '?' }}:</span>
           <p class="text">{{ msg.text }}</p>
           <button @click="likeMessage(msg)"> ❤️ {{ msg.likes }} </button>
         </div>
